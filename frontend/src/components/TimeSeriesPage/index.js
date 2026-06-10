@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import styled from '@emotion/styled';
 import Plot from 'react-plotly.js';
+import { API_BASE_URL } from '../../services/api';
 
 const PageContainer = styled.div`
   padding: 30px;
@@ -76,7 +77,7 @@ const TimeSeriesPage = () => {
     // Fetch available variables on component mount
     const fetchVars = async () => {
       try {
-        const response = await fetch('/api/available-variables/');
+        const response = await fetch(`${API_BASE_URL}/available-variables/`);
         const data = await response.json();
         setAvailableVars(data);
         setXVariable(data.time[0] || '');
@@ -97,7 +98,7 @@ const TimeSeriesPage = () => {
             end_date: endDate,
             variables: `${xVariable},${yVariable}`
         });
-        const response = await fetch(`/api/time-series/?${params}`);
+        const response = await fetch(`${API_BASE_URL}/time-series/?${params}`);
         if (!response.ok) {
             const err = await response.json();
             throw new Error(err.error || 'Failed to fetch data');

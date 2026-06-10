@@ -1,17 +1,18 @@
 from django.http import JsonResponse
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import json
+import os
 from .services.data_processor import DataProcessor
 from .services.asset_benchmark import AssetBenchmark
 from .services.interconnector_flows import (
     InterconnectorDataError,
     fetch_interconnector_flows_snapshot,
 )
-import pandas as pd
-import numpy as np
-import os
 
 from .services.fetch_boa_to_processed import fetch_date_to_processed
+import pandas as pd
+import numpy as np
 
 data_processor = DataProcessor()
 
@@ -19,6 +20,7 @@ NODE_CAPABILITY_FILE = "node_view_capability_from_direct_bridge_validated.csv"
 NODE_BMU_MAPPING_FILE = "direct_connected_bmu_to_lookup_gnode_validated.csv"
 NMS_NODE_BMU_MAPPING_FILE = "nms_node_bmu_mapping.csv"
 NMS_NODE_COORDINATE_ENRICHMENT_FILE = "nms_node_coordinate_enrichment.csv"
+NODE_MAPPING_COVERAGE_SUMMARY_TEMPLATE = "node_mapping_coverage_summary_{year}.json"
 NODE_MAPPING_COVERAGE_CACHE = {}
 
 
@@ -108,6 +110,27 @@ def _clean_bmu_id_set(series):
         .dropna()
         .tolist()
     )
+
+
+def _load_precomputed_node_mapping_coverage_summary(year):
+    summary_path = os.path.join(
+        data_processor.data_dir,
+        NODE_MAPPING_COVERAGE_SUMMARY_TEMPLATE.format(year=year),
+    )
+
+    if not os.path.exists(summary_path):
+        return None
+
+    try:
+        with open(summary_path, 'r', encoding='utf-8') as file:
+            summary = json.load(file)
+    except (OSError, ValueError):
+        return None
+
+    if isinstance(summary, dict):
+        return summary
+
+    return None
 
 
 def _build_coverage_metric_row(mapping_key, label, mapped_bmus, year_df):
@@ -226,6 +249,10 @@ def _coverage_metric_row_from_accumulator(mapping_key, label, accumulator):
 
 
 def _get_node_mapping_coverage_summary(year):
+    precomputed = _load_precomputed_node_mapping_coverage_summary(year)
+    if precomputed is not None:
+        return precomputed
+
     processed_file = os.path.join(data_processor.processed_dir, f'{year}boadf_processed.csv')
     nms_mapping_file = os.path.join(data_processor.data_dir, NMS_NODE_BMU_MAPPING_FILE)
     nms_enrichment_file = os.path.join(data_processor.data_dir, NMS_NODE_COORDINATE_ENRICHMENT_FILE)
@@ -892,6 +919,144 @@ def _load_processed_year_df(year):
     return df
 
 
+def _processed_metric_usecols(processed_file):
+    header = pd.read_csv(processed_file, nrows=0)
+    available_cols = set(header.columns)
+
+    desired_cols = [
+        'settlement_date',
+        'settlement_period',
+        'gsp_group_id',
+        'bm_unit',
+        'national_grid_bm_unit',
+        'acceptance_id',
+        'total_volume_accepted',
+        'system_operator_flag',
+        'balancing_cost',
+        'accepted_price',
+        'bmu_fuel_type',
+    ]
+
+    usecols = [col for col in desired_cols if col in available_cols]
+
+    required_cols = [
+        'settlement_date',
+        'settlement_period',
+        'bm_unit',
+        'acceptance_id',
+        'total_volume_accepted',
+    ]
+
+    missing_required = [col for col in required_cols if col not in usecols]
+    if missing_required:
+        raise ValueError(
+            f"Processed file {processed_file} missing required node metric columns: {missing_required}"
+        )
+
+    return usecols
+
+
+def _normalise_processed_metric_df(df):
+    df = df.copy()
+
+    if 'national_grid_bm_unit' not in df.columns:
+        df['national_grid_bm_unit'] = pd.NA
+    if 'system_operator_flag' not in df.columns:
+        df['system_operator_flag'] = 0
+    if 'balancing_cost' not in df.columns:
+        df['balancing_cost'] = 0.0
+    if 'bmu_fuel_type' not in df.columns:
+        df['bmu_fuel_type'] = ''
+    if 'accepted_price' not in df.columns:
+        df['accepted_price'] = pd.NA
+    if 'gsp_group_id' not in df.columns:
+        df['gsp_group_id'] = pd.NA
+
+    df['settlement_date'] = _parse_mixed_settlement_dates(df['settlement_date'])
+    df['settlement_period'] = pd.to_numeric(df['settlement_period'], errors='coerce').fillna(0).astype(int)
+
+    df['bm_unit'] = _normalise_text_series(df['bm_unit'])
+    df['national_grid_bm_unit'] = _normalise_text_series(df['national_grid_bm_unit'])
+
+    df['acceptance_id'] = pd.to_numeric(df['acceptance_id'], errors='coerce')
+    df['total_volume_accepted'] = pd.to_numeric(df['total_volume_accepted'], errors='coerce').fillna(0.0)
+    df['system_operator_flag'] = pd.to_numeric(df['system_operator_flag'], errors='coerce').fillna(0).astype(int)
+    df['balancing_cost'] = pd.to_numeric(df['balancing_cost'], errors='coerce').fillna(0.0)
+    df['accepted_price'] = pd.to_numeric(df['accepted_price'], errors='coerce')
+    df['gsp_group_id'] = _normalise_text_series(df['gsp_group_id'])
+    df['bmu_fuel_type'] = df['bmu_fuel_type'].fillna('').astype(str).str.strip()
+
+    return df
+
+
+def _load_processed_date_range_df(year, start_date, end_date, bmu_list=None):
+    processed_file = os.path.join(data_processor.processed_dir, f'{year}boadf_processed.csv')
+    if not os.path.exists(processed_file):
+        return None
+
+    start_key = start_date.strftime('%Y-%m-%d')
+    end_key = end_date.strftime('%Y-%m-%d')
+    usecols = _processed_metric_usecols(processed_file)
+    bmu_set = set(bmu_list or [])
+    chunks = []
+
+    for chunk in pd.read_csv(
+        processed_file,
+        usecols=usecols,
+        chunksize=100_000,
+        low_memory=False,
+    ):
+        chunk = _normalise_processed_metric_df(chunk)
+        date_mask = (
+            (chunk['settlement_date'] >= start_key) &
+            (chunk['settlement_date'] <= end_key)
+        )
+
+        if bmu_set:
+            bmu_mask = (
+                chunk['bm_unit'].isin(bmu_set) |
+                chunk['national_grid_bm_unit'].isin(bmu_set)
+            )
+            date_mask = date_mask & bmu_mask
+
+        matched = chunk.loc[date_mask].copy()
+        if not matched.empty:
+            chunks.append(matched)
+
+    if not chunks:
+        return pd.DataFrame(columns=usecols)
+
+    return pd.concat(chunks, ignore_index=True)
+
+
+def _load_core_date_range_df(year, start_date, end_date):
+    core_file = os.path.join(data_processor.core_data_dir, f'core_data_{year}.csv')
+    if not os.path.exists(core_file):
+        return None
+
+    start_key = start_date.strftime('%Y-%m-%d')
+    end_key = end_date.strftime('%Y-%m-%d')
+    chunks = []
+
+    for chunk in pd.read_csv(core_file, chunksize=50_000):
+        if 'settlement_date' not in chunk.columns:
+            continue
+
+        chunk['settlement_date'] = _parse_mixed_settlement_dates(chunk['settlement_date'])
+        matched = chunk.loc[
+            (chunk['settlement_date'] >= start_key) &
+            (chunk['settlement_date'] <= end_key)
+        ].copy()
+
+        if not matched.empty:
+            chunks.append(matched)
+
+    if not chunks:
+        return pd.DataFrame()
+
+    return pd.concat(chunks, ignore_index=True)
+
+
 def _apply_nms_allocation_weights(node_day_df, bmu_weights):
     if node_day_df.empty or not bmu_weights:
         return node_day_df
@@ -1495,26 +1660,15 @@ def time_series_data(request):
 
     all_data = []
     for year in range(start_date.year, end_date.year + 1):
-        core_file = os.path.join(data_processor.core_data_dir, f'core_data_{year}.csv')
-        if os.path.exists(core_file):
-            df = pd.read_csv(core_file)
-
-            if 'settlement_date' in df.columns:
-                df['settlement_date'] = pd.to_datetime(
-                    df['settlement_date'],
-                    errors='coerce',
-                    dayfirst=True
-                )
-
+        df = _load_core_date_range_df(year, start_date, end_date)
+        if df is not None and not df.empty:
             all_data.append(df)
 
     if not all_data:
         return JsonResponse({'error': 'No data available for the selected date range'}, status=404)
 
     full_df = pd.concat(all_data, ignore_index=True)
-
-    mask = (full_df['settlement_date'] >= start_date) & (full_df['settlement_date'] <= end_date)
-    filtered_df = full_df.loc[mask]
+    filtered_df = full_df.copy()
 
     if filtered_df.empty:
         return JsonResponse({'error': 'No data available for the selected date range'}, status=404)
@@ -1536,7 +1690,7 @@ def time_series_data(request):
     ]
 
     if 'settlement_date' in response_df.columns:
-        response_df['settlement_date'] = response_df['settlement_date'].dt.strftime('%Y-%m-%d')
+        response_df['settlement_date'] = response_df['settlement_date'].astype(str)
 
     return JsonResponse(response_df.to_dict('records'), safe=False)
 
@@ -1583,26 +1737,15 @@ def asset_benchmark_data(request):
 
     all_data = []
     for year in range(start_date.year, end_date.year + 1):
-        processed_file = os.path.join(data_processor.processed_dir, f'{year}boadf_processed.csv')
-        if os.path.exists(processed_file):
-            df = pd.read_csv(processed_file)
-
-            if 'settlement_date' in df.columns:
-                df['settlement_date'] = pd.to_datetime(
-                    df['settlement_date'],
-                    errors='coerce',
-                    dayfirst=True
-                )
-
+        df = _load_processed_date_range_df(year, start_date, end_date)
+        if df is not None and not df.empty:
             all_data.append(df)
 
     if not all_data:
         return JsonResponse({'error': 'No data available for the selected date range'}, status=404)
 
     full_df = pd.concat(all_data, ignore_index=True)
-
-    mask = (full_df['settlement_date'] >= start_date) & (full_df['settlement_date'] <= end_date)
-    filtered_df = full_df.loc[mask]
+    filtered_df = full_df.copy()
 
     if filtered_df.empty:
         return JsonResponse({'error': 'No data available for the selected date range'}, status=404)
@@ -1843,31 +1986,24 @@ def node_metrics(request):
         mapping_row_count = len(bmu_list)
 
     year = date.year
-    processed_df = _load_processed_year_df(year)
+    target_date = date.strftime('%Y-%m-%d')
+    processed_df = _load_processed_date_range_df(year, date, date, bmu_list=bmu_list)
 
     if processed_df is None:
         try:
             fetch_date_to_processed(
-                settlement_date=date.strftime('%Y-%m-%d'),
+                settlement_date=target_date,
                 max_sp=50,
                 sleep_ms=250,
             )
-            processed_df = _load_processed_year_df(year)
+            processed_df = _load_processed_date_range_df(year, date, date, bmu_list=bmu_list)
         except Exception as e:
             return JsonResponse({'error': f'Fallback fetch failed: {str(e)}'}, status=500)
 
     if processed_df is None:
         return JsonResponse({'error': 'Processed data not available for the selected date.'}, status=404)
 
-    target_date = date.strftime('%Y-%m-%d')
-
-    node_day_df = processed_df[
-        (processed_df['settlement_date'] == target_date) &
-        (
-            processed_df['bm_unit'].isin(bmu_list) |
-            processed_df['national_grid_bm_unit'].isin(bmu_list)
-        )
-    ].copy()
+    node_day_df = processed_df.copy()
 
     if node_type == 'nms_node':
         node_day_df = _apply_nms_allocation_weights(node_day_df, allocation_weight_map)

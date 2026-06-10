@@ -529,6 +529,62 @@ class DataProcessor:
     # -------------------------------------------------------------------------
     # Data access
     # -------------------------------------------------------------------------
+    def _load_daily_core_rows(self, core_file, date_str):
+        daily_chunks = []
+
+        for chunk in pd.read_csv(core_file, chunksize=50_000):
+            if 'settlement_date' not in chunk.columns:
+                continue
+
+            chunk['settlement_date'] = self._parse_mixed_settlement_dates(
+                chunk['settlement_date']
+            )
+            matched = chunk[chunk['settlement_date'] == date_str].copy()
+
+            if not matched.empty:
+                daily_chunks.append(matched)
+
+        if not daily_chunks:
+            return pd.DataFrame()
+
+        return pd.concat(daily_chunks, ignore_index=True)
+
+    def _normalise_daily_core_types(self, daily_data):
+        numeric_cols = [
+            'settlement_period',
+            'net_volume',
+            'boas_count',
+            'bids_count',
+            'offers_count',
+            'total_accepted_instructions',
+            'zero_volume_actions_count',
+            'mixed_direction_actions_count',
+            'system_volume',
+            'energy_volume',
+            'balancing_cost',
+        ]
+
+        for col in numeric_cols:
+            if col in daily_data.columns:
+                daily_data[col] = pd.to_numeric(
+                    daily_data[col],
+                    errors='coerce'
+                ).fillna(0)
+
+        for col in [
+            'settlement_period',
+            'boas_count',
+            'bids_count',
+            'offers_count',
+            'total_accepted_instructions',
+            'zero_volume_actions_count',
+            'mixed_direction_actions_count',
+        ]:
+            if col in daily_data.columns:
+                daily_data[col] = daily_data[col].astype(int)
+
+        return daily_data
+
     def get_daily_data(self, date):
         year = date.year
         core_file = os.path.join(self.core_data_dir, f'core_data_{year}.csv')
@@ -539,14 +595,8 @@ class DataProcessor:
         if not os.path.exists(core_file):
             return None
 
-        df = pd.read_csv(core_file)
         date_str = date.strftime('%Y-%m-%d')
-
-        # Normalize date format defensively so both YYYY-MM-DD and local-style dates work
-        if 'settlement_date' in df.columns:
-            df['settlement_date'] = self._parse_mixed_settlement_dates(df['settlement_date'])
-
-        daily_data = df[df['settlement_date'] == date_str].copy()
+        daily_data = self._load_daily_core_rows(core_file, date_str)
 
         if daily_data.empty:
             return {
@@ -568,6 +618,8 @@ class DataProcessor:
 
         if 'mixed_direction_actions_count' not in daily_data.columns:
             daily_data['mixed_direction_actions_count'] = 0
+
+        daily_data = self._normalise_daily_core_types(daily_data)
 
         max_sp = daily_data['settlement_period'].max()
         if max_sp == 48:

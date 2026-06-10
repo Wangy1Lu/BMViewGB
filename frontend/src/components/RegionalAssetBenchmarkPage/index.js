@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import styled from '@emotion/styled';
 import { GB_ZONES } from '../Map/zones';
+import { API_BASE_URL } from '../../services/api';
 
 const zoneNameMap = GB_ZONES.reduce((acc, zone) => {
     acc[zone.id] = zone.name;
@@ -104,7 +105,7 @@ const RegionalAssetBenchmarkPage = () => {
         setResults(null);
         try {
             const query = new URLSearchParams(params);
-            const response = await fetch(`/api/asset-benchmark/?${query}`);
+            const response = await fetch(`${API_BASE_URL}/asset-benchmark/?${query}`);
             if (!response.ok) {
                 const err = await response.json();
                 throw new Error(err.error || 'Failed to fetch benchmark data');

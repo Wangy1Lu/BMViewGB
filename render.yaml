@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r backend/requirements.txt && python backend/manage.py collectstatic --noinput
-    startCommand: cd backend && python manage.py migrate --noinput && python manage.py bootstrap_data --require-data && gunicorn core.wsgi:application --bind 0.0.0.0:$PORT
+    startCommand: cd backend && python manage.py migrate --noinput && python manage.py bootstrap_data --require-data && gunicorn core.wsgi:application --bind 0.0.0.0:$PORT --timeout 120
     healthCheckPath: /api/available-variables/
     envVars:
       - key: PYTHON_VERSION
