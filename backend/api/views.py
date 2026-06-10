@@ -159,6 +159,72 @@ def _build_coverage_metric_row(mapping_key, label, mapped_bmus, year_df):
     }
 
 
+def _new_coverage_accumulator(mapped_bmus):
+    return {
+        'mapped_bmus': set(mapped_bmus or []),
+        'seen_bmus': set(),
+        'mapped_bmus_seen': set(),
+        'total_offer_mwh': 0.0,
+        'mapped_offer_mwh': 0.0,
+        'total_bid_mwh': 0.0,
+        'mapped_bid_mwh': 0.0,
+    }
+
+
+def _update_coverage_accumulator(accumulator, bmu_series, volume_series):
+    seen_bmus = set(bmu_series.dropna().unique())
+    mapped_bmus = accumulator['mapped_bmus']
+    mapped_mask = bmu_series.isin(mapped_bmus)
+
+    offer_volume = volume_series.clip(lower=0.0)
+    bid_volume = -volume_series.clip(upper=0.0)
+
+    accumulator['seen_bmus'].update(seen_bmus)
+    accumulator['mapped_bmus_seen'].update(seen_bmus & mapped_bmus)
+    accumulator['total_offer_mwh'] += float(offer_volume.sum())
+    accumulator['mapped_offer_mwh'] += float(offer_volume.loc[mapped_mask].sum())
+    accumulator['total_bid_mwh'] += float(bid_volume.sum())
+    accumulator['mapped_bid_mwh'] += float(bid_volume.loc[mapped_mask].sum())
+
+
+def _coverage_metric_row_from_accumulator(mapping_key, label, accumulator):
+    total_bmus_seen = len(accumulator['seen_bmus'])
+    mapped_bmus_seen = len(accumulator['mapped_bmus_seen'])
+    unmapped_bmus_seen = max(total_bmus_seen - mapped_bmus_seen, 0)
+
+    total_offer_mwh = accumulator['total_offer_mwh']
+    mapped_offer_mwh = accumulator['mapped_offer_mwh']
+    total_bid_mwh = accumulator['total_bid_mwh']
+    mapped_bid_mwh = accumulator['mapped_bid_mwh']
+
+    unmapped_offer_mwh = max(total_offer_mwh - mapped_offer_mwh, 0.0)
+    unmapped_bid_mwh = max(total_bid_mwh - mapped_bid_mwh, 0.0)
+
+    bmu_missing_rate_pct = _safe_rate(unmapped_bmus_seen, total_bmus_seen)
+    offer_missing_rate_pct = _safe_rate(unmapped_offer_mwh, total_offer_mwh)
+    bid_missing_rate_pct = _safe_rate(unmapped_bid_mwh, total_bid_mwh)
+
+    return {
+        'mapping': mapping_key,
+        'label': label,
+        'total_bmus_seen': int(total_bmus_seen),
+        'mapped_bmus_seen': int(mapped_bmus_seen),
+        'unmapped_bmus_seen': int(unmapped_bmus_seen),
+        'bmu_coverage_rate_pct': 100.0 - bmu_missing_rate_pct,
+        'bmu_missing_rate_pct': bmu_missing_rate_pct,
+        'total_offer_mwh': total_offer_mwh,
+        'mapped_offer_mwh': mapped_offer_mwh,
+        'unmapped_offer_mwh': unmapped_offer_mwh,
+        'offer_coverage_rate_pct': 100.0 - offer_missing_rate_pct,
+        'offer_missing_rate_pct': offer_missing_rate_pct,
+        'total_bid_mwh': total_bid_mwh,
+        'mapped_bid_mwh': mapped_bid_mwh,
+        'unmapped_bid_mwh': unmapped_bid_mwh,
+        'bid_coverage_rate_pct': 100.0 - bid_missing_rate_pct,
+        'bid_missing_rate_pct': bid_missing_rate_pct,
+    }
+
+
 def _get_node_mapping_coverage_summary(year):
     processed_file = os.path.join(data_processor.processed_dir, f'{year}boadf_processed.csv')
     nms_mapping_file = os.path.join(data_processor.data_dir, NMS_NODE_BMU_MAPPING_FILE)
@@ -186,26 +252,6 @@ def _get_node_mapping_coverage_summary(year):
     if missing_cols:
         return None
 
-    year_df = pd.read_csv(
-        processed_file,
-        usecols=required_cols,
-        low_memory=False,
-    )
-
-    if year_df.empty:
-        return None
-
-    year_df['settlement_date'] = _parse_mixed_settlement_dates(year_df['settlement_date'])
-    year_df['bmu_id'] = _normalise_text_series(year_df['bm_unit'])
-    year_df['accepted_mwh'] = pd.to_numeric(
-        year_df['total_volume_accepted'],
-        errors='coerce'
-    ).fillna(0.0)
-    year_df = year_df.dropna(subset=['settlement_date', 'bmu_id']).copy()
-
-    if year_df.empty:
-        return None
-
     nms_mapping_df = _load_nms_node_bmu_mapping_df()
     if nms_mapping_df is None:
         nms_mapping_df = pd.DataFrame(columns=['direct_connected_bmu_id'])
@@ -222,25 +268,70 @@ def _get_node_mapping_coverage_summary(year):
     if gnode_mapping_df is None:
         gnode_mapping_df = pd.DataFrame(columns=['direct_connected_bmu_id'])
 
+    coverage_accumulators = {
+        'nms_visible': _new_coverage_accumulator(
+            _clean_bmu_id_set(nms_visible_df['direct_connected_bmu_id'])
+        ),
+        'gnode_validated': _new_coverage_accumulator(
+            _clean_bmu_id_set(gnode_mapping_df['direct_connected_bmu_id'])
+        ),
+    }
+
+    date_min = None
+    date_max = None
+
+    for chunk in pd.read_csv(
+        processed_file,
+        usecols=required_cols,
+        chunksize=200_000,
+        low_memory=False,
+    ):
+        if chunk.empty:
+            continue
+
+        settlement_dates = _parse_mixed_settlement_dates(chunk['settlement_date'])
+        bmu_series = _normalise_text_series(chunk['bm_unit'])
+        volume_series = pd.to_numeric(
+            chunk['total_volume_accepted'],
+            errors='coerce'
+        ).fillna(0.0)
+
+        valid_mask = settlement_dates.notna() & bmu_series.notna()
+        if not valid_mask.any():
+            continue
+
+        valid_dates = settlement_dates.loc[valid_mask]
+        chunk_date_min = valid_dates.min()
+        chunk_date_max = valid_dates.max()
+        date_min = chunk_date_min if date_min is None else min(date_min, chunk_date_min)
+        date_max = chunk_date_max if date_max is None else max(date_max, chunk_date_max)
+
+        valid_bmus = bmu_series.loc[valid_mask]
+        valid_volumes = volume_series.loc[valid_mask]
+
+        for accumulator in coverage_accumulators.values():
+            _update_coverage_accumulator(accumulator, valid_bmus, valid_volumes)
+
+    if date_min is None or date_max is None:
+        return None
+
     mapping_rows = [
-        _build_coverage_metric_row(
+        _coverage_metric_row_from_accumulator(
             'nms_visible',
             'NMS node mapping',
-            _clean_bmu_id_set(nms_visible_df['direct_connected_bmu_id']),
-            year_df,
+            coverage_accumulators['nms_visible'],
         ),
-        _build_coverage_metric_row(
+        _coverage_metric_row_from_accumulator(
             'gnode_validated',
             'GNode direct mapping',
-            _clean_bmu_id_set(gnode_mapping_df['direct_connected_bmu_id']),
-            year_df,
+            coverage_accumulators['gnode_validated'],
         ),
     ]
 
     result = {
         'year': int(year),
-        'date_min': str(year_df['settlement_date'].min()),
-        'date_max': str(year_df['settlement_date'].max()),
+        'date_min': str(date_min),
+        'date_max': str(date_max),
         'basis': 'Annual coverage against BMUs present in the local processed BOA dataset after GSP mapping.',
         'denominator_source': f'{year}boadf_processed.csv',
         'volume_basis': 'Accepted offer MWh uses positive total_volume_accepted; accepted bid MWh uses absolute negative total_volume_accepted.',
