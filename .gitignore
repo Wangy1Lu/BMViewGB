@@ -1,0 +1,44 @@
+__pycache__/
+*.py[cod]
+*.log
+*.err
+.env
+.env.*
+!.env.example
+dist/
+venv/
+.venv/
+.codex_backend_check_venv/
+frontend/node_modules/
+frontend/build/
+backend/db.sqlite3
+backend/staticfiles/
+
+# Local build and deployment artefacts
+.codex_frontend_build_check/
+.deploy_artifacts/
+.deploy_publish/
+artifacts/
+overleaf_template_build*/
+template_fixed_build/
+
+# Report editing/export artefacts are not part of the website source tree.
+BMViewGB_report/
+BMViewGB_report_overleaf_template_fixed/
+BMViewGB_report_removed_content_backup/
+BMViewGB_old/
+BMViewGB_report_overleaf_template_fixed.zip
+BMViewGB_report_overleaf_upload.zip
+
+# Large local binaries used only for report compilation.
+tools/tectonic-*/
+tools/tectonic-*.zip
+
+# Local data-maintenance workbench. Runtime/deployment scripts live under
+# backend/scripts and frontend/scripts instead.
+tools/data_maintenance/
+
+# Duplicate GIS working copies; the runtime frontend uses the public GeoJSON
+# and generated gspGroupPaths.js instead.
+frontend/src/components/Map/Proj_*/
+*.gpkg
