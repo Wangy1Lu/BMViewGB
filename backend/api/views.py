@@ -1,6 +1,7 @@
 from django.http import JsonResponse
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from collections import OrderedDict
 import json
 import os
 from .services.data_processor import DataProcessor
@@ -22,6 +23,15 @@ NMS_NODE_BMU_MAPPING_FILE = "nms_node_bmu_mapping.csv"
 NMS_NODE_COORDINATE_ENRICHMENT_FILE = "nms_node_coordinate_enrichment.csv"
 NODE_MAPPING_COVERAGE_SUMMARY_TEMPLATE = "node_mapping_coverage_summary_{year}.json"
 NODE_MAPPING_COVERAGE_CACHE = {}
+PROCESSED_DAY_CACHE = OrderedDict()
+ISO_DATE_PATTERN = r'^\d{4}-\d{2}-\d{2}$'
+
+
+def _processed_day_cache_limit():
+    try:
+        return max(0, int(os.environ.get('BMVIEWGB_PROCESSED_DAY_CACHE_SIZE', '8')))
+    except (TypeError, ValueError):
+        return 8
 
 
 def _daily_data_has_rows(data):
@@ -91,6 +101,38 @@ def _sum_mix_dicts(dict_series):
 
 def _file_mtime_or_none(path):
     return os.path.getmtime(path) if os.path.exists(path) else None
+
+
+def _file_identity(path):
+    absolute_path = os.path.abspath(path)
+
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return (absolute_path, None, None)
+
+    return (absolute_path, stat.st_mtime, stat.st_size)
+
+
+def _processed_day_cache_get(cache_key):
+    cached = PROCESSED_DAY_CACHE.get(cache_key)
+    if cached is None:
+        return None
+
+    PROCESSED_DAY_CACHE.move_to_end(cache_key)
+    return cached.copy()
+
+
+def _processed_day_cache_set(cache_key, df):
+    limit = _processed_day_cache_limit()
+    if limit <= 0:
+        return
+
+    PROCESSED_DAY_CACHE[cache_key] = df.copy()
+    PROCESSED_DAY_CACHE.move_to_end(cache_key)
+
+    while len(PROCESSED_DAY_CACHE) > limit:
+        PROCESSED_DAY_CACHE.popitem(last=False)
 
 
 def _safe_rate(numerator, denominator):
@@ -989,6 +1031,149 @@ def _normalise_processed_metric_df(df):
     return df
 
 
+def _empty_processed_metric_df(usecols):
+    return _normalise_processed_metric_df(pd.DataFrame(columns=usecols))
+
+
+def _normalise_bmu_filter_values(bmu_list):
+    bmu_values = set()
+
+    for value in bmu_list or []:
+        if pd.isna(value):
+            continue
+
+        cleaned = str(value).strip()
+        if not cleaned or cleaned.lower() in {'nan', 'none'}:
+            continue
+
+        bmu_values.add(cleaned)
+
+    return bmu_values
+
+
+def _raw_settlement_date_parts(series):
+    text_dates = series.astype('string').str.strip()
+    iso_mask = text_dates.str.match(ISO_DATE_PATTERN, na=False).astype(bool)
+    iso_values = text_dates.loc[iso_mask]
+
+    min_date = str(iso_values.min()) if not iso_values.empty else None
+    max_date = str(iso_values.max()) if not iso_values.empty else None
+
+    return text_dates, iso_mask, min_date, max_date
+
+
+def _raw_settlement_date_mask(series, start_key, end_key, text_dates=None, iso_mask=None):
+    if text_dates is None or iso_mask is None:
+        text_dates, iso_mask, _, _ = _raw_settlement_date_parts(series)
+
+    mask = (
+        iso_mask &
+        text_dates.ge(start_key).fillna(False) &
+        text_dates.le(end_key).fillna(False)
+    ).astype(bool)
+
+    non_iso_mask = ~iso_mask
+    if non_iso_mask.any():
+        parsed_dates = _parse_mixed_settlement_dates(series.loc[non_iso_mask])
+        parsed_mask = (
+            parsed_dates.ge(start_key) &
+            parsed_dates.le(end_key)
+        ).fillna(False).astype(bool)
+        mask.loc[parsed_mask.index] = parsed_mask
+
+    return mask.fillna(False).astype(bool)
+
+
+def _raw_bmu_match_mask(chunk, bmu_set):
+    if not bmu_set:
+        return pd.Series(True, index=chunk.index)
+
+    mask = pd.Series(False, index=chunk.index)
+
+    for col in ['bm_unit', 'national_grid_bm_unit']:
+        if col not in chunk.columns:
+            continue
+
+        mask = mask | chunk[col].astype('string').str.strip().isin(bmu_set).fillna(False)
+
+    return mask.astype(bool)
+
+
+def _filter_processed_df_by_bmus(df, bmu_set):
+    if df.empty or not bmu_set:
+        return df.copy()
+
+    mask = pd.Series(False, index=df.index)
+
+    for col in ['bm_unit', 'national_grid_bm_unit']:
+        if col in df.columns:
+            mask = mask | df[col].isin(bmu_set).fillna(False)
+
+    return df.loc[mask].copy()
+
+
+def _load_processed_single_day_df(processed_file, usecols, date_key):
+    cache_key = (_file_identity(processed_file), date_key)
+    cached = _processed_day_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    chunks = []
+    previous_max_date = None
+    sorted_by_date = True
+
+    for chunk in pd.read_csv(
+        processed_file,
+        usecols=usecols,
+        chunksize=100_000,
+        low_memory=False,
+    ):
+        text_dates, iso_mask, min_date, max_date = _raw_settlement_date_parts(
+            chunk['settlement_date']
+        )
+
+        if (
+            sorted_by_date and
+            min_date is not None and
+            previous_max_date is not None and
+            min_date < previous_max_date
+        ):
+            sorted_by_date = False
+
+        if sorted_by_date and min_date is not None and min_date > date_key:
+            break
+
+        if max_date is not None:
+            previous_max_date = (
+                max(previous_max_date, max_date)
+                if previous_max_date is not None
+                else max_date
+            )
+
+        if sorted_by_date and max_date is not None and max_date < date_key:
+            continue
+
+        date_mask = _raw_settlement_date_mask(
+            chunk['settlement_date'],
+            date_key,
+            date_key,
+            text_dates=text_dates,
+            iso_mask=iso_mask,
+        )
+
+        if date_mask.any():
+            chunks.append(_normalise_processed_metric_df(chunk.loc[date_mask].copy()))
+
+    result = (
+        pd.concat(chunks, ignore_index=True)
+        if chunks
+        else _empty_processed_metric_df(usecols)
+    )
+
+    _processed_day_cache_set(cache_key, result)
+    return result.copy()
+
+
 def _load_processed_date_range_df(year, start_date, end_date, bmu_list=None):
     processed_file = os.path.join(data_processor.processed_dir, f'{year}boadf_processed.csv')
     if not os.path.exists(processed_file):
@@ -997,8 +1182,15 @@ def _load_processed_date_range_df(year, start_date, end_date, bmu_list=None):
     start_key = start_date.strftime('%Y-%m-%d')
     end_key = end_date.strftime('%Y-%m-%d')
     usecols = _processed_metric_usecols(processed_file)
-    bmu_set = set(bmu_list or [])
+    bmu_set = _normalise_bmu_filter_values(bmu_list)
+
+    if start_key == end_key:
+        day_df = _load_processed_single_day_df(processed_file, usecols, start_key)
+        return _filter_processed_df_by_bmus(day_df, bmu_set)
+
     chunks = []
+    previous_max_date = None
+    sorted_by_date = True
 
     for chunk in pd.read_csv(
         processed_file,
@@ -1006,25 +1198,47 @@ def _load_processed_date_range_df(year, start_date, end_date, bmu_list=None):
         chunksize=100_000,
         low_memory=False,
     ):
-        chunk = _normalise_processed_metric_df(chunk)
-        date_mask = (
-            (chunk['settlement_date'] >= start_key) &
-            (chunk['settlement_date'] <= end_key)
+        text_dates, iso_mask, min_date, max_date = _raw_settlement_date_parts(
+            chunk['settlement_date']
+        )
+
+        if (
+            sorted_by_date and
+            min_date is not None and
+            previous_max_date is not None and
+            min_date < previous_max_date
+        ):
+            sorted_by_date = False
+
+        if sorted_by_date and min_date is not None and min_date > end_key:
+            break
+
+        if max_date is not None:
+            previous_max_date = (
+                max(previous_max_date, max_date)
+                if previous_max_date is not None
+                else max_date
+            )
+
+        if sorted_by_date and max_date is not None and max_date < start_key:
+            continue
+
+        date_mask = _raw_settlement_date_mask(
+            chunk['settlement_date'],
+            start_key,
+            end_key,
+            text_dates=text_dates,
+            iso_mask=iso_mask,
         )
 
         if bmu_set:
-            bmu_mask = (
-                chunk['bm_unit'].isin(bmu_set) |
-                chunk['national_grid_bm_unit'].isin(bmu_set)
-            )
-            date_mask = date_mask & bmu_mask
+            date_mask = date_mask & _raw_bmu_match_mask(chunk, bmu_set)
 
-        matched = chunk.loc[date_mask].copy()
-        if not matched.empty:
-            chunks.append(matched)
+        if date_mask.any():
+            chunks.append(_normalise_processed_metric_df(chunk.loc[date_mask].copy()))
 
     if not chunks:
-        return pd.DataFrame(columns=usecols)
+        return _empty_processed_metric_df(usecols)
 
     return pd.concat(chunks, ignore_index=True)
 
