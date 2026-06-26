@@ -68,3 +68,9 @@ npm run build
 
 This project includes a zero-paid deployment path using Render free services and
 a public runtime data bundle. See `docs/free_deployment.md`.
+
+## Acknowledgements
+
+This project acknowledges the earlier BMViewGB work by Emre Tekcan, which served
+as an important reference and foundation for this version. The original
+repository is available at [emtekcan/BMViewGB](https://github.com/emtekcan/BMViewGB/tree/main).
